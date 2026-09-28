@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import io
 import os
 import sys
@@ -66,16 +68,9 @@ SYSTEM_PROMPT = {
     ),
 }
 
-# Document parsers & LangChain components (lazy-loaded if needed)
-from pypdf import PdfReader
-import docx
-from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
+# Document parsers, embeddings and the vector store are imported lazily inside
+# the functions that need them: importing them at startup delayed port binding
+# and exceeded Render's 512MB memory limit.
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +120,7 @@ class StatusResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Direct Groq API Client (requests-based)
 # ---------------------------------------------------------------------------
-def call_groq_api(messages: list[dict], model: Optional[str] = None) -> str:
+def call_groq_api(messages: list[dict], model: Optional[str] = None, temperature: Optional[float] = None) -> str:
     """Direct HTTP request to Groq API as defined in the user's reference code."""
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
@@ -139,6 +134,8 @@ def call_groq_api(messages: list[dict], model: Optional[str] = None) -> str:
         "model": target_model,
         "messages": messages
     }
+    if temperature is not None:
+        payload["temperature"] = temperature
 
     try:
         response = requests.post(
@@ -184,23 +181,25 @@ def call_groq_api(messages: list[dict], model: Optional[str] = None) -> str:
 # ---------------------------------------------------------------------------
 # Document Extractors
 # ---------------------------------------------------------------------------
-def extract_text_from_pdf(file_bytes: bytes, filename: str) -> List[Document]:
+def extract_text_from_pdf(file_bytes: bytes, filename: str) -> List[dict]:
+    from pypdf import PdfReader
     reader = PdfReader(io.BytesIO(file_bytes))
-    docs: List[Document] = []
+    docs: List[dict] = []
     for page_idx, page in enumerate(reader.pages, start=1):
         text = page.extract_text() or ""
         text = text.strip()
         if text:
-            docs.append(Document(
-                page_content=text,
-                metadata={"source": filename, "page": page_idx, "file_type": "pdf"}
-            ))
+            docs.append({
+                "content": text,
+                "metadata": {"source": filename, "page": page_idx, "file_type": "pdf"}
+            })
     if not docs:
         raise ValueError("Could not extract any readable text from the uploaded PDF.")
     return docs
 
 
-def extract_text_from_docx(file_bytes: bytes, filename: str) -> List[Document]:
+def extract_text_from_docx(file_bytes: bytes, filename: str) -> List[dict]:
+    import docx
     doc = docx.Document(io.BytesIO(file_bytes))
     extracted_paragraphs: List[str] = []
     for para in doc.paragraphs:
@@ -214,29 +213,94 @@ def extract_text_from_docx(file_bytes: bytes, filename: str) -> List[Document]:
     full_text = "\n\n".join(extracted_paragraphs).strip()
     if not full_text:
         raise ValueError("Could not extract any readable text from the uploaded DOCX.")
-    return [Document(page_content=full_text, metadata={"source": filename, "file_type": "docx"})]
+    return [{"content": full_text, "metadata": {"source": filename, "file_type": "docx"}}]
+
+
+def split_text(
+    text: str,
+    chunk_size: int = 800,
+    chunk_overlap: int = 120,
+    separators: tuple = ("\n\n", "\n", ". ", " ", ""),
+) -> List[str]:
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= chunk_size:
+        return [text]
+    if not separators:
+        return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+    sep, rest = separators[0], separators[1:]
+    if sep and sep not in text:
+        return split_text(text, chunk_size, chunk_overlap, rest)
+    pieces = text.split(sep) if sep else [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+
+    chunks: List[str] = []
+    current = ""
+    for piece in pieces:
+        piece = piece.strip()
+        if not piece:
+            continue
+        if len(piece) > chunk_size:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.extend(split_text(piece, chunk_size, chunk_overlap, rest))
+            continue
+        candidate = piece if not current else current + sep + piece
+        if len(candidate) <= chunk_size:
+            current = candidate
+        else:
+            chunks.append(current)
+            current = current[-chunk_overlap:] + sep + piece if chunk_overlap else piece
+            if len(current) > chunk_size:
+                current = piece
+    if current:
+        chunks.append(current)
+    return [c for c in chunks if c.strip()]
 
 
 # ---------------------------------------------------------------------------
 # RAG Service Manager
 # ---------------------------------------------------------------------------
+RAG_SYSTEM_PROMPT = (
+    "You are an expert document analysis assistant. Your job is to answer user questions "
+    "truthfully and concisely based on the provided context retrieved from the document.\n\n"
+    "Guidelines:\n"
+    "1. If the user greeting is conversational (like 'hello', 'hi', 'hlo', 'hey'), respond warmly and offer assistance with the document.\n"
+    "2. Base factual answers strictly on the context provided below.\n"
+    "3. If the answer cannot be found in the context, clearly state: "
+    "'Based on the uploaded document, I cannot find information to answer this question.' Do not guess or fabricate information.\n"
+    "4. Cite the relevant source chunks (e.g., [Source Chunk 1]) when referencing details.\n"
+    "5. Format your output clearly with bullet points, paragraphs, or tables where appropriate."
+)
+
+
 class RAGManager:
     def __init__(self):
         self._lock = threading.Lock()
-        self.vector_store: Optional[FAISS] = None
+        self.chunks: List[dict] = []
+        self._matrix = None
         self.current_filename: Optional[str] = None
         self.total_chunks: int = 0
-        self._embeddings: Optional[HuggingFaceEmbeddings] = None
+        self._embedding_model = None
 
     @property
-    def embeddings(self) -> HuggingFaceEmbeddings:
-        if self._embeddings is None:
-            self._embeddings = HuggingFaceEmbeddings(
-                model_name=EMBEDDING_MODEL_NAME,
-                model_kwargs={"device": "cpu"},
-                encode_kwargs={"normalize_embeddings": True}
-            )
-        return self._embeddings
+    def is_loaded(self) -> bool:
+        return bool(self.chunks)
+
+    @property
+    def embedding_model(self):
+        if self._embedding_model is None:
+            from fastembed import TextEmbedding
+            self._embedding_model = TextEmbedding(model_name=EMBEDDING_MODEL_NAME)
+        return self._embedding_model
+
+    def _embed(self, texts: List[str]):
+        import numpy as np
+        vectors = np.asarray(list(self.embedding_model.embed(texts)), dtype="float32")
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return vectors / norms
 
     def ingest_document(self, filename: str, file_bytes: bytes) -> int:
         lower_name = filename.lower()
@@ -247,82 +311,62 @@ class RAGManager:
         else:
             raise ValueError("Unsupported file format. Please upload a PDF or DOCX file.")
 
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=800,
-            chunk_overlap=120,
-            separators=["\n\n", "\n", ". ", " ", ""]
-        )
-        split_chunks = splitter.split_documents(raw_docs)
+        split_chunks: List[dict] = []
+        for doc in raw_docs:
+            for piece in split_text(doc["content"]):
+                split_chunks.append({"content": piece, "metadata": dict(doc["metadata"])})
         if not split_chunks:
             raise ValueError("Document was parsed, but no text chunks could be produced.")
 
         for idx, chunk in enumerate(split_chunks, start=1):
-            chunk.metadata["chunk_id"] = idx
+            chunk["metadata"]["chunk_id"] = idx
 
+        matrix = self._embed([chunk["content"] for chunk in split_chunks])
         with self._lock:
-            self.vector_store = FAISS.from_documents(split_chunks, self.embeddings)
+            self.chunks = split_chunks
+            self._matrix = matrix
             self.current_filename = filename
             self.total_chunks = len(split_chunks)
 
         return self.total_chunks
 
     def answer_query(self, question: str, top_k: int = 4) -> dict:
-        if self.vector_store is None:
+        with self._lock:
+            chunks, matrix = self.chunks, self._matrix
+        if not chunks:
             # Fall back to direct Groq chat
             messages = [SYSTEM_PROMPT, {"role": "user", "content": question}]
             answer = call_groq_api(messages)
             return {"question": question, "answer": answer, "sources": []}
 
-        api_key = os.getenv("GROQ_API_KEY", "").strip()
-        if not api_key:
-            raise ValueError("Groq API key is missing. Please set GROQ_API_KEY in your .env file.")
-
-        docs_and_scores = self.vector_store.similarity_search_with_score(question, k=top_k)
+        import numpy as np
+        similarities = matrix @ self._embed([question])[0]
         context_parts = []
         sources = []
-        for doc, score in docs_and_scores:
-            page_info = f" (Page {doc.metadata.get('page')})" if "page" in doc.metadata else ""
+        for idx in np.argsort(-similarities)[:top_k]:
+            chunk = chunks[int(idx)]
+            metadata = chunk["metadata"]
+            page_info = f" (Page {metadata['page']})" if "page" in metadata else ""
             context_parts.append(
-                f"[Source Chunk {doc.metadata.get('chunk_id', '?')}{page_info}]:\n{doc.page_content}"
+                f"[Source Chunk {metadata.get('chunk_id', '?')}{page_info}]:\n{chunk['content']}"
             )
             sources.append({
-                "content": doc.page_content,
+                "content": chunk["content"],
                 "metadata": {
-                    **doc.metadata,
-                    "relevance_distance": round(float(score), 4)
+                    **metadata,
+                    "relevance_distance": round(float(1 - similarities[idx]), 4)
                 }
             })
 
         formatted_context = "\n\n---\n\n".join(context_parts)
-
-        llm = ChatGroq(
-            api_key=api_key,
-            model=os.getenv("GROQ_MODEL", MODEL),
-            temperature=0.2,
-            max_tokens=1024,
-        )
-
-        prompt_template = ChatPromptTemplate.from_messages([
-            (
-                "system",
-                "You are an expert document analysis assistant. Your job is to answer user questions "
-                "truthfully and concisely based on the provided context retrieved from the document.\n\n"
-                "Guidelines:\n"
-                "1. If the user greeting is conversational (like 'hello', 'hi', 'hlo', 'hey'), respond warmly and offer assistance with the document.\n"
-                "2. Base factual answers strictly on the context provided below.\n"
-                "3. If the answer cannot be found in the context, clearly state: "
-                "'Based on the uploaded document, I cannot find information to answer this question.' Do not guess or fabricate information.\n"
-                "4. Cite the relevant source chunks (e.g., [Source Chunk 1]) when referencing details.\n"
-                "5. Format your output clearly with bullet points, paragraphs, or tables where appropriate."
-            ),
-            (
-                "human",
-                "Context from document:\n{context}\n\nQuestion:\n{question}\n\nAnswer:"
-            )
-        ])
-
-        chain = prompt_template | llm | StrOutputParser()
-        answer = chain.invoke({"context": formatted_context, "question": question})
+        messages = [
+            {"role": "system", "content": RAG_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": f"Context from document:\n{formatted_context}\n\nQuestion:\n{question}\n\nAnswer:"
+            },
+        ]
+        answer = call_groq_api(messages, temperature=0.2)
 
         return {
             "question": question,
@@ -332,7 +376,8 @@ class RAGManager:
 
     def clear(self):
         with self._lock:
-            self.vector_store = None
+            self.chunks = []
+            self._matrix = None
             self.current_filename = None
             self.total_chunks = 0
 
@@ -387,7 +432,7 @@ def chat(req: ChatRequest):
 @app.post("/ask", response_model=QueryResponse, summary="Ask questions (RAG or General Chat)")
 async def ask_question(request: QueryRequest):
     try:
-        if rag_service.vector_store is not None:
+        if rag_service.is_loaded:
             result = rag_service.answer_query(request.question, top_k=request.top_k)
             return QueryResponse(
                 question=result["question"],
@@ -452,7 +497,7 @@ async def upload_document(file: UploadFile = File(...)):
 @app.get("/status", response_model=StatusResponse, summary="Get current RAG state")
 async def get_status():
     return StatusResponse(
-        document_loaded=rag_service.vector_store is not None,
+        document_loaded=rag_service.is_loaded,
         filename=rag_service.current_filename,
         total_chunks=rag_service.total_chunks,
         embedding_model=EMBEDDING_MODEL_NAME,
